@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 import os.path as osp
 import time
@@ -35,6 +36,12 @@ def make_parser():
         "--save_result",
         action="store_true",
         help="whether to save the inference result of image/video",
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default="outputs/demo_runs",
+        help="root directory to save demo outputs",
     )
 
     # exp file
@@ -241,26 +248,34 @@ def imageflow_demo(predictor, vis_folder, current_time, args):
     timestamp = time.strftime("%Y_%m_%d_%H_%M_%S", current_time)
     save_folder = osp.join(vis_folder, timestamp)
     os.makedirs(save_folder, exist_ok=True)
-    if args.demo == "video":
-        save_path = osp.join(save_folder, args.path.split("/")[-1])
-    else:
-        save_path = osp.join(save_folder, "camera.mp4")
-    logger.info(f"video save_path is {save_path}")
-    vid_writer = cv2.VideoWriter(
-        save_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (int(width), int(height))
-    )
+    if args.save_result:
+        if args.demo == "video":
+            save_path = osp.join(save_folder, args.path.split("/")[-1])
+        else:
+            save_path = osp.join(save_folder, "camera.mp4")
+        logger.info(f"video save_path is {save_path}")
+        vid_writer = cv2.VideoWriter(
+            save_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (int(width), int(height))
+        )
     tracker = BYTETracker(args, frame_rate=30)
     timer = Timer()
     frame_id = 0
     results = []
+    frame_metrics = []
+    total_proc_time = 0.0
+    total_frames = 0
     while True:
         if frame_id % 20 == 0:
             logger.info('Processing frame {} ({:.2f} fps)'.format(frame_id, 1. / max(1e-5, timer.average_time)))
         ret_val, frame = cap.read()
         if ret_val:
+            frame_start = time.time()
             outputs, img_info = predictor.inference(frame, timer)
-            if outputs[0] is not None:
-                online_targets = tracker.update(outputs[0], [img_info['height'], img_info['width']], exp.test_size)
+            frame_output = outputs[0] if outputs and len(outputs) > 0 else None
+            det_count = int(frame_output.shape[0]) if frame_output is not None and frame_output.dim() > 0 else 0
+            valid_track_count = 0
+            if frame_output is not None:
+                online_targets = tracker.update(frame_output, [img_info['height'], img_info['width']], exp.test_size)
                 online_tlwhs = []
                 online_ids = []
                 online_scores = []
@@ -275,6 +290,7 @@ def imageflow_demo(predictor, vis_folder, current_time, args):
                         results.append(
                             f"{frame_id},{tid},{tlwh[0]:.2f},{tlwh[1]:.2f},{tlwh[2]:.2f},{tlwh[3]:.2f},{t.score:.2f},-1,-1,-1\n"
                         )
+                valid_track_count = len(online_ids)
                 timer.toc()
                 online_im = plot_tracking(
                     img_info['raw_img'], online_tlwhs, online_ids, frame_id=frame_id + 1, fps=1. / timer.average_time
@@ -282,6 +298,20 @@ def imageflow_demo(predictor, vis_folder, current_time, args):
             else:
                 timer.toc()
                 online_im = img_info['raw_img']
+
+            frame_proc_time = time.time() - frame_start
+            total_proc_time += frame_proc_time
+            total_frames += 1
+            frame_metrics.append(
+                {
+                    "frame_id": frame_id + 1,
+                    "detections": det_count,
+                    "valid_tracks": valid_track_count,
+                    "latency_ms": round(frame_proc_time * 1000.0, 3),
+                    "fps": round(1.0 / max(1e-6, frame_proc_time), 3),
+                }
+            )
+
             if args.save_result:
                 vid_writer.write(online_im)
             ch = cv2.waitKey(1)
@@ -297,6 +327,33 @@ def imageflow_demo(predictor, vis_folder, current_time, args):
             f.writelines(results)
         logger.info(f"save results to {res_file}")
 
+    avg_latency_ms = (total_proc_time / max(1, total_frames)) * 1000.0
+    avg_fps = total_frames / max(1e-6, total_proc_time)
+    metrics = {
+        "summary": {
+            "avg_fps": round(avg_fps, 4),
+            "avg_latency_ms": round(avg_latency_ms, 4),
+            "total_frames": int(total_frames),
+            "video_path": args.path if args.demo == "video" else f"webcam:{args.camid}",
+        },
+        "per_frame": frame_metrics,
+    }
+    metrics_dir = osp.join(save_folder, "metrics")
+    os.makedirs(metrics_dir, exist_ok=True)
+    metrics_json_path = osp.join(metrics_dir, "metrics.json")
+    with open(metrics_json_path, "w") as f:
+        json.dump(metrics, f, indent=2)
+
+    summary_txt_path = osp.join(metrics_dir, "summary.txt")
+    with open(summary_txt_path, "w") as f:
+        f.write(f"avg_fps: {metrics['summary']['avg_fps']}\n")
+        f.write(f"avg_latency_ms: {metrics['summary']['avg_latency_ms']}\n")
+        f.write(f"total_frames: {metrics['summary']['total_frames']}\n")
+        f.write(f"video_path: {metrics['summary']['video_path']}\n")
+        f.write(f"per_frame_metrics_json: {metrics_json_path}\n")
+    logger.info(f"save metrics json to {metrics_json_path}")
+    logger.info(f"save metrics summary to {summary_txt_path}")
+
 
 def main(exp, args):
     if not args.experiment_name:
@@ -304,9 +361,9 @@ def main(exp, args):
 
     output_dir = osp.join(exp.output_dir, args.experiment_name)
     os.makedirs(output_dir, exist_ok=True)
-
-    if args.save_result:
-        vis_folder = osp.join(output_dir, "track_vis")
+    # Demo outputs are stored under outputs/demo_runs/{timestamp}/ by default.
+    vis_folder = args.output_dir
+    if args.save_result or args.demo in ["video", "webcam"]:
         os.makedirs(vis_folder, exist_ok=True)
 
     if args.trt:
